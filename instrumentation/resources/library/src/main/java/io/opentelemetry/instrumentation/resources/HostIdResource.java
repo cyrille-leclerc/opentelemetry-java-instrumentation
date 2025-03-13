@@ -7,12 +7,16 @@ package io.opentelemetry.instrumentation.resources;
 
 import static java.util.logging.Level.FINE;
 
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.sdk.autoconfigure.spi.ResourceProvider;
 import io.opentelemetry.sdk.resources.Resource;
 import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystems;
@@ -45,20 +49,24 @@ public final class HostIdResource {
       new HostIdResource(
           HostIdResource::getOsTypeSystemProperty,
           HostIdResource::readMachineIdFile,
-          HostIdResource::queryWindowsRegistry);
+          HostIdResource::queryWindowsRegistry,
+          HostIdResource::querySpHardwareDataType);
 
   private final Supplier<String> getOsType;
   private final Function<Path, List<String>> machineIdReader;
   private final Supplier<List<String>> queryWindowsRegistry;
+  private final Supplier<InputStream> queryMacOsxSpHardwareDataType;
 
   // Visible for testing
   HostIdResource(
       Supplier<String> getOsType,
       Function<Path, List<String>> machineIdReader,
-      Supplier<List<String>> queryWindowsRegistry) {
+      Supplier<List<String>> queryWindowsRegistry,
+      Supplier<InputStream> queryMacOsxSpHardwareDataType) {
     this.getOsType = getOsType;
     this.machineIdReader = machineIdReader;
     this.queryWindowsRegistry = queryWindowsRegistry;
+    this.queryMacOsxSpHardwareDataType = queryMacOsxSpHardwareDataType;
   }
 
   /** Returns a {@link Resource} containing the {@code host.id} resource attribute. */
@@ -74,6 +82,9 @@ public final class HostIdResource {
     if (runningLinux()) {
       return readLinuxMachineId();
     }
+    if (runningMacOsx()) {
+      return readMacOsxPlatformUuid();
+    }
     logger.log(FINE, "Unsupported OS type: {0}", getOsType.get());
     return Resource.empty();
   }
@@ -84,6 +95,10 @@ public final class HostIdResource {
 
   private boolean runningWindows() {
     return getOsType.get().startsWith("Windows");
+  }
+
+  private boolean runningMacOsx() {
+    return getOsType.get().equals("Mac OS X");
   }
 
   // see
@@ -152,6 +167,70 @@ public final class HostIdResource {
     } catch (IOException | InterruptedException e) {
       logger.log(FINE, "Failed to read Windows registry", e);
       return Collections.emptyList();
+    }
+  }
+
+  private Resource readMacOsxPlatformUuid() {
+    InputStream in = queryMacOsxSpHardwareDataType.get();
+
+    if (in == null) {
+      return Resource.empty();
+    }
+
+    try {
+      JsonFactory jsonFactory = new JsonFactory();
+      try (JsonParser parser = jsonFactory.createParser(in)) {
+        parser.nextToken();
+
+        if (!parser.isExpectedStartObjectToken()) {
+          throw new IOException(
+              "Invalid JSON executing 'system_profiler SPHardwareDataType -json'");
+        }
+
+        while (parser.nextToken() != JsonToken.END_OBJECT) {
+          if ("platform_UUID".equals(parser.currentName())) {
+            return Resource.create(Attributes.of(HOST_ID, parser.nextTextValue()));
+          }
+        }
+      } catch (IOException e) {
+        logger.log(
+            FINE, "Could not parse SPHardwareDataType JSON document, resource not filled.", e);
+        return Resource.empty();
+      }
+    } finally {
+      try {
+        in.close();
+      } catch (IOException e) {
+        logger.log(FINE, "Could closing shell input stream", e);
+      }
+    }
+
+    logger.fine("Failed to read MacOs platform UUID: No platform_UUID found in output ");
+    return Resource.empty();
+  }
+
+  private static InputStream querySpHardwareDataType() {
+    try {
+      ProcessBuilder processBuilder =
+          new ProcessBuilder("system_profiler", "SPHardwareDataType", "-json");
+      processBuilder.redirectErrorStream(true);
+      Process process = processBuilder.start();
+      int exitedValue = process.waitFor();
+      InputStream in;
+      if (exitedValue != 0) {
+        logger.fine(
+            "Failed to read system_profiler SPHardwareDataType. Exit code: "
+                + exitedValue
+                + " Output: TODO ADD OUTPUT");
+
+        in = null;
+      } else {
+        in = process.getInputStream();
+      }
+      return in;
+    } catch (IOException | InterruptedException e) {
+      logger.log(FINE, "Exception invoking 'system_profiler SPHardwareDataType -json'", e);
+      return null;
     }
   }
 
